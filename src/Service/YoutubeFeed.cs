@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.ServiceModel;
+using System.ServiceModel.Channels;
 using System.ServiceModel.Syndication;
 using System.ServiceModel.Web;
 using System.Threading.Tasks;
@@ -27,6 +28,7 @@ namespace Service
 
         private readonly Cache<Arguments, SyndicationFeedFormatter> _feedCache;
         private readonly Cache<(string videoId, string encoding), string> _contentCache;
+        private readonly Cache<string, object> _throttlerCache;
         private readonly YoutubeClient _youtubeClient;
         private readonly YouTubeService _youtubeService;
 
@@ -34,6 +36,7 @@ namespace Service
         {
             _feedCache = new Cache<Arguments, SyndicationFeedFormatter>(15.Minutes());
             _contentCache = new Cache<(string videoId, string encoding), string>(2.Hours());
+            _throttlerCache = new Cache<string, object>(15.Seconds());
 
             _youtubeClient = new YoutubeClient();
             _youtubeService =
@@ -176,6 +179,12 @@ namespace Service
         {
             var context = WebOperationContext.Current;
 
+            if (ShouldThrottle(OperationContext.Current))
+            {
+                context.OutgoingResponse.StatusCode = (HttpStatusCode) 249;
+                return;
+            }
+
             if (_contentCache.TryGet((videoId, encoding), out var redirectUri))
             {
                 context.OutgoingResponse.RedirectTo(redirectUri);
@@ -299,7 +308,7 @@ namespace Service
             return (await statisticsRequest.ExecuteAsync()).Items;
         }
 
-        private static string GetTitle(string title, Arguments arguments) =>
+        private string GetTitle(string title, Arguments arguments) =>
             arguments.IsPopular ? $"{title} (By Popularity)" : title;
 
         private Rss20FeedFormatter CacheFeed(Arguments arguments, SyndicationFeed feed)
@@ -309,14 +318,45 @@ namespace Service
             return formatter;
         }
 
-        private static string GetBaseAddress()
+        private bool ShouldThrottle(OperationContext context)
+        {
+            var incomingEndpointAddress = GetIncomingEndpointAddress(context);
+            if (_throttlerCache.TryGet(incomingEndpointAddress, out _))
+            {
+                return true;
+            }
+
+            _throttlerCache.Set(incomingEndpointAddress, null);
+            return false;
+        }
+
+        private string GetIncomingEndpointAddress(OperationContext context)
+        {
+            var properties = context.IncomingMessageProperties;
+
+            var address = string.Empty;
+            if (properties.TryGetProperty<HttpRequestMessageProperty>(HttpRequestMessageProperty.Name, out var endpointLoadBalancer) &&
+                endpointLoadBalancer?.Headers["X-Forwarded-For"] != null)
+            {
+                address = endpointLoadBalancer.Headers["X-Forwarded-For"];
+            }
+
+            if (properties.TryGetProperty<RemoteEndpointMessageProperty>(RemoteEndpointMessageProperty.Name, out var endpoint))
+            {
+                address = endpoint.Address;
+            }
+
+            return address;
+        }
+
+        private string GetBaseAddress()
         {
             var transportAddress = OperationContext.Current.IncomingMessageProperties.Via;
             return $"http://{transportAddress.DnsSafeHost}:{transportAddress.Port}/FeedService";
         }
     }
 
-    public static class OutgoingWebResponseContextExtension
+    public static class Extensions
     {
         public static void RedirectTo(this OutgoingWebResponseContext context, string redirectUri)
         {
@@ -329,6 +369,16 @@ namespace Service
             {
                 context.StatusCode = HttpStatusCode.NotFound;
             }
+        }
+
+        public static bool TryGetProperty<TProperty>(this MessageProperties properties, string propertyName, out TProperty property)
+        {
+            var exists = properties.TryGetValue(propertyName, out var value);
+            property = exists && value is TProperty typedProperty
+                ? typedProperty
+                : default;
+
+            return exists;
         }
     }
 }
