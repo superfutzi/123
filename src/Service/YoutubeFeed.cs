@@ -181,7 +181,7 @@ namespace Service
 
             if (ShouldThrottle(OperationContext.Current))
             {
-                context.OutgoingResponse.StatusCode = (HttpStatusCode) 249;
+                context.OutgoingResponse.StatusCode = (HttpStatusCode) 429;
                 return;
             }
 
